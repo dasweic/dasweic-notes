@@ -31,7 +31,7 @@ try:
     from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QTimer, Signal, QObject, QUrl, QEvent
     from PySide6.QtGui import (
         QAction, QColor, QBrush, QPen, QFont, QPainter, QPainterPath,
-        QPolygonF, QKeySequence, QShortcut, QPixmap, QImageReader, QImage, QTransform
+        QPolygonF, QKeySequence, QShortcut, QPixmap, QImageReader, QImage, QTransform, QGuiApplication
     )
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
@@ -41,7 +41,7 @@ try:
         QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
         QToolBar, QStatusBar, QColorDialog, QSpinBox, QComboBox, QTextEdit,
         QCheckBox, QInputDialog, QProgressDialog, QMenu, QSplitter, QFrame,
-        QFontComboBox, QSlider, QScrollArea, QGraphicsEffect
+        QFontComboBox, QSlider, QScrollArea, QGraphicsEffect, QPlainTextEdit, QDialogButtonBox, QSplashScreen
     )
 except ImportError as exc:
     print("Dasweic Notes needs PySide6. Install it with: python -m pip install PySide6 cryptography")
@@ -55,6 +55,21 @@ try:
 except ImportError:
     QMediaPlayer = QAudioOutput = QVideoWidget = None
     MEDIA_AVAILABLE = False
+
+# Recording APIs are optional and vary by the installed Qt Multimedia backend.
+try:
+    from PySide6.QtMultimedia import (
+        QMediaDevices, QAudioInput, QCamera, QMediaCaptureSession, QMediaRecorder, QMediaFormat
+    )
+    try:
+        from PySide6.QtMultimedia import QScreenCapture
+    except ImportError:
+        QScreenCapture = None
+    CAPTURE_AVAILABLE = True
+except ImportError:
+    QMediaDevices = QAudioInput = QCamera = QMediaCaptureSession = QMediaRecorder = QMediaFormat = None
+    QScreenCapture = None
+    CAPTURE_AVAILABLE = False
 
 try:
     from PySide6.QtPdf import QPdfDocument
@@ -134,7 +149,7 @@ def stream_encrypt(src: Path, dst: Path, password: str, progress_callback=None) 
         fout.write(mac.finalize())
 
 
-def stream_decrypt(src: Path, dst: Path, password: str) -> None:
+def stream_decrypt(src: Path, dst: Path, password: str, progress_callback=None) -> None:
     """Authenticate the complete container before writing any decrypted bytes."""
     size = src.stat().st_size
     if size < len(MAGIC) + 16 + 16 + 32:
@@ -152,12 +167,16 @@ def stream_decrypt(src: Path, dst: Path, password: str) -> None:
         f.seek(0)
         mac = crypto_hmac.HMAC(mac_key, hashes.SHA256())
         remaining = size - 32
+        authenticated = 0
         while remaining:
             block = f.read(min(CHUNK, remaining))
             if not block:
                 raise ValueError("Project ended unexpectedly.")
             mac.update(block)
             remaining -= len(block)
+            authenticated += len(block)
+            if progress_callback:
+                progress_callback(min(45, int(authenticated * 45 / max(1, size - 32))), "Verifying project integrity…")
         try:
             mac.verify(supplied_tag)
         except Exception as exc:
@@ -166,12 +185,16 @@ def stream_decrypt(src: Path, dst: Path, password: str) -> None:
         decryptor = Cipher(algorithms.AES(enc_key), modes.CTR(nonce)).decryptor()
         with dst.open("wb") as out:
             remaining = encrypted_len
+            decrypted = 0
             while remaining:
                 block = f.read(min(CHUNK, remaining))
                 if not block:
                     raise ValueError("Project ended unexpectedly.")
                 out.write(decryptor.update(block))
                 remaining -= len(block)
+                decrypted += len(block)
+                if progress_callback:
+                    progress_callback(45 + min(35, int(decrypted * 35 / max(1, encrypted_len))), "Decrypting project data…")
             out.write(decryptor.finalize())
 
 
@@ -917,6 +940,7 @@ class CanvasView(QGraphicsView):
     toolChanged = Signal(str)
     itemResized = Signal(object)
     attachmentActivated = Signal(str)
+    attachmentContextMenu = Signal(str, object)
 
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
@@ -1169,6 +1193,16 @@ class CanvasView(QGraphicsView):
             self.set_tool("select"); event.accept(); return
         super().mouseReleaseEvent(event)
 
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.pos())
+        while item and not isinstance(item, (NoteTextItem, CanvasItem)):
+            item = item.parentItem()
+        if isinstance(item, CanvasItem) and item.data.get("path"):
+            self.attachmentContextMenu.emit(str(item.data.get("path")), event.globalPos())
+            event.accept()
+            return
+        super().contextMenuEvent(event)
+
     def mouseDoubleClickEvent(self, event):
         item = self.itemAt(event.position().toPoint())
         while item and not isinstance(item, (NoteTextItem, CanvasItem)):
@@ -1210,6 +1244,297 @@ class CanvasView(QGraphicsView):
             event.ignore()
 
 
+class TextAttachmentViewer(QDialog):
+    """Read-only, non-executing text preview with a conservative size limit."""
+    PREVIEW_LIMIT = 2 * 1024 * 1024
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.path = Path(path)
+        self.setWindowTitle(f"Dasweic Notes · {self.path.name}")
+        self.resize(900, 680)
+        layout = QVBoxLayout(self)
+        heading = QLabel(self.path.name)
+        heading.setStyleSheet(f"font-size:17px;font-weight:700;color:{TEXT};")
+        layout.addWidget(heading)
+        self.editor = QPlainTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setStyleSheet(f"background:#090e19;color:{TEXT};border:1px solid {BORDER};border-radius:10px;padding:10px;font-family:monospace;")
+        layout.addWidget(self.editor, 1)
+        try:
+            size = self.path.stat().st_size
+            with self.path.open("rb") as f:
+                raw = f.read(self.PREVIEW_LIMIT + 1)
+            truncated = len(raw) > self.PREVIEW_LIMIT
+            raw = raw[:self.PREVIEW_LIMIT]
+            try:
+                content = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                content = raw.decode("utf-8", errors="replace")
+            # Avoid treating likely binary data as readable text.
+            if "\x00" in content[:8192]:
+                raise ValueError("This file appears to contain binary data, not plain text.")
+            self.editor.setPlainText(content)
+            if truncated:
+                self.editor.appendPlainText("\n\n[Preview truncated for safety. Export the file to inspect the complete contents.]")
+            self.status = QLabel(f"{size:,} bytes · read-only preview")
+        except (OSError, ValueError) as exc:
+            self.editor.setPlainText(f"Unable to preview this text file.\n\n{exc}")
+            self.status = QLabel("Preview unavailable")
+        layout.addWidget(self.status)
+        close = styled_button("Close", True)
+        close.clicked.connect(self.accept)
+        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        self.setStyleSheet(DIALOG_STYLE)
+
+
+class CaptureDialog(QDialog):
+    """Qt Multimedia recorder for audio, webcam+mic, or screen+optional mic.
+
+    Real capture availability depends on the Qt build, OS permissions, devices, and codecs.
+    A completed recording is only reported after QMediaRecorder signals StoppedState.
+    """
+    completed = Signal(str)
+
+    def __init__(self, mode: str, output_path: Path, parent=None):
+        super().__init__(parent)
+        self.mode = mode
+        self.output_path = output_path
+        self.session = None
+        self.recorder = None
+        self.audio_input = None
+        self.camera = None
+        self.screen_capture = None
+        self.video_widget = None
+        self.elapsed_ms = 0
+        self.started_at = None
+        self._paused_at = None
+        self._cancelled = False
+        self._reported = False
+        self.setWindowTitle({"audio":"Audio recording", "camera":"Camera + microphone recording", "screen":"Screen recording"}.get(mode, "Recording"))
+        self.resize(760, 560)
+        root = QVBoxLayout(self)
+        self.title_label = QLabel(self.windowTitle())
+        self.title_label.setStyleSheet(f"font-size:18px;font-weight:700;color:{TEXT}")
+        root.addWidget(self.title_label)
+        self.status_label = QLabel("Preparing capture devices…")
+        self.status_label.setStyleSheet(f"color:{CYAN};font-weight:600")
+        root.addWidget(self.status_label)
+        self.preview_label = QLabel("Audio capture" if mode == "audio" else "Camera preview will appear here" if mode == "camera" else "Screen capture selected")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(250)
+        self.preview_label.setStyleSheet(f"background:#050912;border:1px solid {BORDER};border-radius:12px;color:{MUTED};padding:10px")
+        root.addWidget(self.preview_label, 1)
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("Microphone"))
+        self.mic_combo = QComboBox()
+        self.mic_combo.addItem("System default microphone", None)
+        if CAPTURE_AVAILABLE:
+            try:
+                for device in QMediaDevices.audioInputs():
+                    self.mic_combo.addItem(device.description(), device)
+            except Exception:
+                pass
+        device_row.addWidget(self.mic_combo, 2)
+        if mode == "camera":
+            device_row.addWidget(QLabel("Camera"))
+            self.camera_combo = QComboBox()
+            if CAPTURE_AVAILABLE:
+                try:
+                    for device in QMediaDevices.videoInputs():
+                        self.camera_combo.addItem(device.description(), device)
+                except Exception:
+                    pass
+            device_row.addWidget(self.camera_combo, 2)
+        elif mode == "screen":
+            device_row.addWidget(QLabel("Monitor"))
+            self.screen_combo = QComboBox()
+            for screen in QGuiApplication.screens():
+                self.screen_combo.addItem(screen.name() or "Monitor", screen)
+            device_row.addWidget(self.screen_combo, 2)
+        root.addLayout(device_row)
+        self.duration_label = QLabel("00:00")
+        self.duration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.duration_label.setStyleSheet(f"font-size:24px;font-weight:700;color:{CYAN};padding:6px")
+        root.addWidget(self.duration_label)
+        buttons = QHBoxLayout()
+        self.start_button = styled_button("●  Start recording", True)
+        self.pause_button = styled_button("Ⅱ  Pause")
+        self.resume_button = styled_button("▶  Resume")
+        self.stop_button = styled_button("■  Stop")
+        self.cancel_button = styled_button("Cancel")
+        for b in (self.start_button, self.pause_button, self.resume_button, self.stop_button, self.cancel_button): buttons.addWidget(b)
+        root.addLayout(buttons)
+        self.pause_button.setEnabled(False); self.resume_button.setEnabled(False); self.stop_button.setEnabled(False)
+        self.start_button.clicked.connect(self.start_recording)
+        self.pause_button.clicked.connect(self.pause_recording)
+        self.resume_button.clicked.connect(self.resume_recording)
+        self.stop_button.clicked.connect(self.stop_recording)
+        self.cancel_button.clicked.connect(self.cancel_recording)
+        self.clock = QTimer(self); self.clock.setInterval(200); self.clock.timeout.connect(self.update_duration)
+        self.setStyleSheet(DIALOG_STYLE)
+        if not CAPTURE_AVAILABLE:
+            self.status_label.setText("Recording support is unavailable in this PySide6 installation.")
+            self.start_button.setEnabled(False)
+        elif mode == "camera" and self.camera_combo.count() == 0:
+            self.status_label.setText("No camera devices were detected.")
+            self.start_button.setEnabled(False)
+        elif mode == "screen" and QScreenCapture is None:
+            self.status_label.setText("This Qt build does not include screen capture support.")
+            self.start_button.setEnabled(False)
+        elif mode == "camera":
+            # Open the camera before recording so the user can verify framing.
+            try:
+                self._prepare()
+                self.status_label.setText("Camera preview ready · press Start when ready")
+            except Exception as exc:
+                self.status_label.setText("Camera preview unavailable")
+                self.start_button.setEnabled(False)
+                QMessageBox.warning(self, APP_NAME, f"Could not initialize camera preview. Check camera/microphone permissions and device availability.\n\n{exc}")
+
+    def _prepare(self):
+        self.session = QMediaCaptureSession(self)
+        self.recorder = QMediaRecorder(self)
+        self.session.setRecorder(self.recorder)
+        mic = self.mic_combo.currentData()
+        if mic is None:
+            inputs = QMediaDevices.audioInputs()
+            mic = inputs[0] if inputs else None
+        if self.mode in ("audio", "camera") and mic is None:
+            raise RuntimeError("No microphone was detected. Connect one and check operating-system microphone permissions.")
+        if mic is not None:
+            self.audio_input = QAudioInput(mic, self)
+            self.session.setAudioInput(self.audio_input)
+        if self.mode == "camera":
+            device = self.camera_combo.currentData()
+            if device is None:
+                raise RuntimeError("No camera is selected.")
+            self.camera = QCamera(device, self)
+            self.session.setCamera(self.camera)
+            from PySide6.QtMultimediaWidgets import QVideoWidget
+            self.video_widget = QVideoWidget(self)
+            self.video_widget.setMinimumHeight(250)
+            self.session.setVideoOutput(self.video_widget)
+            self.preview_label.hide()
+            self.layout().insertWidget(2, self.video_widget, 1)
+            self.camera.start()
+        elif self.mode == "screen":
+            self.screen_capture = QScreenCapture(self)
+            screen = self.screen_combo.currentData()
+            if screen is None:
+                raise RuntimeError("No monitor is selected.")
+            self.screen_capture.setScreen(screen)
+            self.session.setScreenCapture(self.screen_capture)
+            self.screen_capture.setActive(True)
+        self.recorder.errorOccurred.connect(self._record_error)
+        self.recorder.recorderStateChanged.connect(self._state_changed)
+        # Prefer broadly supported formats; leave Qt's default if format selection is rejected.
+        try:
+            fmt = QMediaFormat()
+            fmt.setFileFormat(QMediaFormat.FileFormat.MPEG4 if self.mode != "audio" else QMediaFormat.FileFormat.Mpeg4Audio)
+            self.recorder.setMediaFormat(fmt)
+        except Exception:
+            pass
+        self.recorder.setOutputLocation(QUrl.fromLocalFile(str(self.output_path.resolve())))
+
+    def start_recording(self):
+        try:
+            if self.recorder is None:
+                self._prepare()
+            if self.mode in ("audio", "camera") and not QMediaDevices.audioInputs():
+                raise RuntimeError("No microphone was detected. Connect a microphone and check OS permissions.")
+            self.recorder.record()
+            self.started_at = time.monotonic()
+            self.clock.start()
+            self.start_button.setEnabled(False); self.pause_button.setEnabled(True); self.stop_button.setEnabled(True)
+            self.status_label.setText("● RECORDING")
+        except Exception as exc:
+            self._release()
+            QMessageBox.warning(self, APP_NAME, f"Could not start recording. Check device permissions and Qt Multimedia codec support.\n\n{exc}")
+
+    def pause_recording(self):
+        if self.recorder:
+            try:
+                self.recorder.pause(); self._paused_at = time.monotonic()
+                self.pause_button.setEnabled(False); self.resume_button.setEnabled(True)
+                self.status_label.setText("PAUSED")
+            except Exception as exc: QMessageBox.warning(self, APP_NAME, f"Pause is not supported by this backend.\n{exc}")
+
+    def resume_recording(self):
+        if self.recorder:
+            try:
+                self.recorder.record(); self._paused_at = None
+                self.pause_button.setEnabled(True); self.resume_button.setEnabled(False)
+                self.status_label.setText("● RECORDING")
+            except Exception as exc: QMessageBox.warning(self, APP_NAME, f"Could not resume recording.\n{exc}")
+
+    def update_duration(self):
+        if self.recorder:
+            duration = max(0, int(self.recorder.duration()))
+            self.duration_label.setText(AttachmentViewer._fmt(duration))
+
+    def _state_changed(self, state):
+        if not CAPTURE_AVAILABLE: return
+        if state == QMediaRecorder.RecorderState.StoppedState and not self._cancelled and self.started_at is not None:
+            # Only report a completed recording after the backend has stopped/finalized the file.
+            QTimer.singleShot(250, self._finalize_completed)
+
+    def _finalize_completed(self):
+        if self._reported or self._cancelled: return
+        self._reported = True
+        self.clock.stop(); self._release(keep_file=True)
+        if self.output_path.is_file() and self.output_path.stat().st_size > 0:
+            self.completed.emit(str(self.output_path))
+            self.status_label.setText("Recording finalized")
+            self.accept()
+        else:
+            QMessageBox.warning(self, APP_NAME, "The recorder stopped but did not produce a valid file.")
+
+    def _record_error(self, error, error_string):
+        self.status_label.setText("RECORDING ERROR")
+        QMessageBox.warning(self, APP_NAME, f"Recording failed. Check device permissions and supported codecs.\n\n{error_string or error}")
+
+    def stop_recording(self):
+        if self.recorder:
+            try:
+                self.recorder.stop()
+                self.status_label.setText("Finalizing recording…")
+                self.start_button.setEnabled(False); self.pause_button.setEnabled(False); self.resume_button.setEnabled(False); self.stop_button.setEnabled(False)
+                QTimer.singleShot(2500, self._finalize_completed)
+            except Exception as exc:
+                QMessageBox.warning(self, APP_NAME, f"Could not stop recording cleanly.\n{exc}")
+
+    def cancel_recording(self):
+        self._cancelled = True
+        self.clock.stop()
+        self._release()
+        try: self.output_path.unlink(missing_ok=True)
+        except OSError: pass
+        self.reject()
+
+    def _release(self, keep_file=False):
+        try:
+            if self.recorder is not None: self.recorder.stop()
+        except Exception: pass
+        try:
+            if self.camera is not None: self.camera.stop()
+        except Exception: pass
+        try:
+            if self.screen_capture is not None: self.screen_capture.setActive(False)
+        except Exception: pass
+        self.recorder = self.session = self.audio_input = self.camera = self.screen_capture = None
+
+    def closeEvent(self, event):
+        if self.started_at is not None and not self._reported and not self._cancelled:
+            answer = QMessageBox.question(self, APP_NAME, "A recording may still be active. Cancel and discard it?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore(); return
+            self.cancel_recording()
+        else:
+            self._release()
+        event.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, auth_data: dict):
         super().__init__()
@@ -1232,6 +1557,7 @@ class MainWindow(QMainWindow):
         self.view.toolChanged.connect(self.update_tool_status)
         self.view.itemResized.connect(self.on_item_resized)
         self.view.attachmentActivated.connect(self.open_attachment)
+        self.view.attachmentContextMenu.connect(self.attachment_context_menu)
         self.setCentralWidget(self.build_layout())
         self.build_actions()
         self.apply_style()
@@ -1281,6 +1607,9 @@ class MainWindow(QMainWindow):
                           ("↗  Add offline link", self.add_link), ("▱  Rectangle", lambda: self.set_tool("rect")),
                           ("✎  Freehand pencil", lambda: self.set_tool("pencil"))]:
             b = styled_button(label); b.clicked.connect(fn); side.addWidget(b)
+        side.addWidget(self.section_label("CAPTURE"))
+        for label, mode in [("●  Record audio", "audio"), ("▣  Camera + mic", "camera"), ("▤  Record screen", "screen")]:
+            b = styled_button(label); b.clicked.connect(lambda checked=False, m=mode: self.start_capture(m)); side.addWidget(b)
         side.addWidget(self.section_label("STYLE"))
         color_btn = styled_button("Stroke color"); color_btn.clicked.connect(self.choose_stroke); side.addWidget(color_btn)
         fill_btn = styled_button("Shape fill"); fill_btn.clicked.connect(self.choose_fill); side.addWidget(fill_btn)
@@ -1328,6 +1657,9 @@ class MainWindow(QMainWindow):
                           ("Save", self.save_project), ("Save As…", self.save_as),
                           ("Export Files…", self.export_files), ("Exit", self.close)]:
             a = file_menu.addAction(label); a.triggered.connect(fn)
+        capture_menu = self.menuBar().addMenu("Capture")
+        for label, mode in [("Record audio…", "audio"), ("Record camera + microphone…", "camera"), ("Record screen…", "screen")]:
+            a = capture_menu.addAction(label); a.triggered.connect(lambda checked=False, m=mode: self.start_capture(m))
         edit_menu = self.menuBar().addMenu("Edit")
         for label, fn in [("Undo", self.undo), ("Redo", self.redo), ("Select all", self.select_all),
                           ("Duplicate", self.duplicate_selected), ("Delete", self.delete_selected)]:
@@ -1405,12 +1737,115 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "This attachment could not be found at its saved location.")
             return
         suffix = file_path.suffix.lower()
+        if suffix in {".txt", ".log", ".md", ".csv", ".json", ".yaml", ".yml", ".ini", ".py", ".html", ".css", ".js"}:
+            viewer = TextAttachmentViewer(str(file_path), self)
+            viewer.exec()
+            return
         supported = AttachmentViewer.VIDEO_EXTS | AttachmentViewer.AUDIO_EXTS | {".pdf"}
         if suffix not in supported:
             QMessageBox.information(self, APP_NAME, "This file type does not have an in-app viewer yet.")
             return
         viewer = AttachmentViewer(str(file_path), self)
         viewer.exec()
+
+    def start_capture(self, mode):
+        if not CAPTURE_AVAILABLE:
+            QMessageBox.warning(self, APP_NAME, "Recording needs a PySide6 build with Qt Multimedia capture APIs. Install/upgrade with: python -m pip install --upgrade PySide6 PySide6-Addons")
+            return
+        folder = self.temp_root / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        extension = ".m4a" if mode == "audio" else ".mp4"
+        default_name = {"audio":"Audio recording", "camera":"Camera recording", "screen":"Screen recording"}.get(mode, "Recording")
+        path, _ = QFileDialog.getSaveFileName(self, "Choose recording filename", str(folder / (default_name + extension)), "Audio/Video files (*%s)" % extension)
+        if not path: return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(extension)
+        if target.exists():
+            answer = QMessageBox.question(self, APP_NAME, f"Replace {target.name}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes: return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            dialog = CaptureDialog(mode, target, self)
+            dialog.completed.connect(self._recording_completed)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not initialize the recorder.\n\n{exc}")
+
+    def _recording_completed(self, path):
+        try:
+            file_path = Path(path)
+            if not file_path.is_file() or file_path.stat().st_size <= 0:
+                raise OSError("The recording file is empty or missing.")
+            self.import_files([str(file_path)], self.view.mapToScene(self.view.viewport().rect().center()))
+            self.mark_dirty()
+            self.statusBar().showMessage(f"Recording attached: {file_path.name}", 6000)
+            QMessageBox.information(self, APP_NAME, f"Recording finalized and attached to the canvas:\n{file_path.name}")
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"The recording finished but could not be attached.\n\n{exc}")
+
+    def attachment_context_menu(self, path, global_pos):
+        file_path = Path(path)
+        menu = QMenu(self)
+        if file_path.is_file():
+            menu.addAction("Open / Preview", lambda p=str(file_path): self.open_attachment(p))
+            menu.addAction("Export / Save As…", lambda p=str(file_path): self.export_attachment(p))
+            menu.addAction("Copy file path", lambda p=str(file_path): QApplication.clipboard().setText(p))
+            menu.addAction("File information", lambda p=str(file_path): self.attachment_info(p))
+        menu.addSeparator()
+        menu.addAction("Remove attachment from canvas", lambda p=str(file_path): self.remove_attachment_by_path(p))
+        menu.exec(global_pos)
+
+    def export_attachment(self, path):
+        source = Path(path)
+        if not source.is_file():
+            QMessageBox.warning(self, APP_NAME, "The attachment file is missing.")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "Export attachment", str(Path.home() / source.name), "All files (*)")
+        if not target: return
+        destination = Path(target)
+        try:
+            if source.resolve() == destination.resolve():
+                QMessageBox.information(self, APP_NAME, "The selected destination is the original file.")
+                return
+        except OSError: pass
+        if destination.exists():
+            answer = QMessageBox.question(self, APP_NAME, f"Replace {destination.name}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes: return
+        staged = destination.with_name(destination.name + ".exporting-" + secrets.token_hex(4))
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with source.open("rb") as fin, staged.open("wb") as fout:
+                shutil.copyfileobj(fin, fout, CHUNK)
+                fout.flush(); os.fsync(fout.fileno())
+            if staged.stat().st_size != source.stat().st_size:
+                raise OSError("The exported file size did not match the source.")
+            os.replace(staged, destination)
+            QMessageBox.information(self, APP_NAME, f"Attachment exported successfully:\n{destination}")
+        except OSError as exc:
+            try: staged.unlink(missing_ok=True)
+            except OSError: pass
+            QMessageBox.critical(self, APP_NAME, f"Export failed. The original project attachment was not removed.\n\n{exc}")
+
+    def attachment_info(self, path):
+        p = Path(path)
+        try:
+            st = p.stat()
+            QMessageBox.information(self, APP_NAME, f"Name: {p.name}\nType: {p.suffix.lower() or 'unknown'}\nSize: {st.st_size:,} bytes\nModified: {time.ctime(st.st_mtime)}\nPath: {p}")
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not read file information.\n{exc}")
+
+    def remove_attachment_by_path(self, path):
+        matches = [item for item in self.scene.items() if isinstance(item, CanvasItem) and item.data.get("path") == path]
+        if not matches: return
+        answer = QMessageBox.question(self, APP_NAME, "Remove this attachment from the canvas? The source file will not be deleted.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes: return
+        for item in matches:
+            self.record({"kind":"delete", "item":item, "pos":item.pos()})
+            self.scene.removeItem(item)
+            for key, value in list(self.objects.items()):
+                if value is item: self.objects.pop(key, None)
+        self.mark_dirty()
 
     def choose_stroke(self):
         c = QColorDialog.getColor(self.view.stroke_color, self, "Stroke color")
@@ -1835,16 +2270,28 @@ class MainWindow(QMainWindow):
         if not d.exec(): return
         work = Path(tempfile.mkdtemp(prefix="dasweic-open-"))
         archive = work / "payload.zip"
+        progress = QProgressDialog("Preparing to open project…", "", 0, 100, self)
+        progress.setWindowTitle("Opening Dasweic Notes")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False)
+        progress.setCancelButton(None); progress.setMinimumWidth(430)
+        progress.setStyleSheet(f"QProgressDialog{{background:{PANEL};color:{TEXT};border:1px solid {BORDER};border-radius:14px;padding:16px}} QLabel{{color:{TEXT};font-size:13px;padding:8px}} QProgressBar{{background:#080d18;border:1px solid {BORDER};border-radius:8px;height:16px;text-align:center;color:{TEXT}}} QProgressBar::chunk{{background:{CYAN};border-radius:7px}}")
+        progress.show(); QApplication.processEvents()
+        def report(value, message):
+            progress.setValue(max(0, min(100, int(value))))
+            progress.setLabelText(message)
+            QApplication.processEvents()
         try:
-            stream_decrypt(Path(path), archive, d.value())
+            report(0, "Reading and verifying encrypted project…")
+            stream_decrypt(Path(path), archive, d.value(), progress_callback=report)
+            report(82, "Reading project manifest…")
             with zipfile.ZipFile(archive, "r") as zf:
                 names = zf.namelist()
                 manifest_name = "manifest.final.json" if "manifest.final.json" in names else "manifest.json"
                 if manifest_name not in names: raise ValueError("Project manifest is missing.")
-                # Reject traversal paths and unexpected archive entries.
                 for name in names:
-                    p = Path(name)
-                    if p.is_absolute() or ".." in p.parts:
+                    member = Path(name)
+                    if member.is_absolute() or ".." in member.parts:
                         raise ValueError("Unsafe path found in project archive.")
                 data = json.loads(zf.read(manifest_name).decode("utf-8"))
                 if data.get("format") != "dasweic-notes" or data.get("version") != APP_VERSION:
@@ -1852,28 +2299,44 @@ class MainWindow(QMainWindow):
                 if not isinstance(data.get("objects"), list): raise ValueError("Invalid project object list.")
                 extraction = self.temp_root / uuid.uuid4().hex
                 extraction.mkdir(parents=True, exist_ok=True)
-                # Validate each embedded path before extraction.
-                for obj in data["objects"]:
-                    attachment = obj.pop("attachment", None)
-                    if attachment:
-                        if attachment not in names or not attachment.startswith("attachments/"):
-                            raise ValueError("An attachment reference is invalid.")
-                        out = extraction / Path(attachment).name
-                        with zf.open(attachment) as src, out.open("wb") as dst:
-                            shutil.copyfileobj(src, dst, CHUNK)
-                        obj["path"] = str(out)
-                # Only mutate the visible workspace after full validation/decryption succeeded.
+                attachments = [(obj, obj.get("attachment")) for obj in data["objects"] if obj.get("attachment")]
+                total = max(1, len(attachments)); copied = 0
+                total_attachment_bytes = max(1, sum(zf.getinfo(name).file_size for _, name in attachments if name in names))
+                restored_bytes = 0
+                for obj, attachment in attachments:
+                    if attachment not in names or not attachment.startswith("attachments/"):
+                        raise ValueError("An attachment reference is invalid.")
+                    out = extraction / Path(attachment).name
+                    report(82 + int(restored_bytes * 12 / total_attachment_bytes), f"Restoring attachment {copied + 1} of {total}…")
+                    with zf.open(attachment) as src, out.open("wb") as dst:
+                        while True:
+                            block = src.read(CHUNK)
+                            if not block:
+                                break
+                            dst.write(block)
+                            restored_bytes += len(block)
+                            if restored_bytes % (8 * CHUNK) < CHUNK or restored_bytes >= total_attachment_bytes:
+                                report(82 + int(restored_bytes * 12 / total_attachment_bytes), f"Restoring attachments… {restored_bytes // (1024 * 1024)} MB")
+                    obj.pop("attachment", None)
+                    obj["path"] = str(out)
+                    copied += 1
+                report(95, "Restoring canvas objects…")
+                # Only mutate the visible workspace after all archive data has been validated.
                 self.scene.clear(); self.objects.clear()
-                for obj in data["objects"]:
+                for index, obj in enumerate(data["objects"]):
                     item = self.data_to_item(obj)
                     self.add_item(item, action=False)
+                    if index % 100 == 0:
+                        report(95 + int(4 * (index + 1) / max(1, len(data["objects"]))), "Restoring canvas objects…")
                 self.undo_stack.clear(); self.redo_stack.clear()
             self.project_path = Path(path); self.project_password = d.value(); self.dirty = False
             self.project_label.setText(Path(path).name)
+            report(100, "Project opened and authenticated.")
             self.statusBar().showMessage("Project opened and authenticated", 5000)
         except (OSError, ValueError, KeyError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
             QMessageBox.critical(self, APP_NAME, f"Could not open project.\n\n{exc}")
         finally:
+            progress.close()
             shutil.rmtree(work, ignore_errors=True)
 
     def confirm_discard(self):
@@ -1945,11 +2408,28 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Dasweic")
     app.setStyle("Fusion")
+    # Compact native splash; no external assets or network resources are required.
+    splash_pix = QPixmap(560, 220)
+    splash_pix.fill(QColor(BG))
+    painter = QPainter(splash_pix)
+    painter.setPen(QColor(CYAN)); painter.setFont(QFont("Noto Sans", 22, QFont.Weight.Bold))
+    painter.drawText(QRectF(24, 34, 512, 58), Qt.AlignmentFlag.AlignCenter, "✦  DASWEIC NOTES")
+    painter.setPen(QColor(TEXT)); painter.setFont(QFont("Noto Sans", 10))
+    painter.drawText(QRectF(24, 94, 512, 30), Qt.AlignmentFlag.AlignCenter, "Preparing your private offline workspace…")
+    painter.setPen(QPen(QColor(BORDER), 1)); painter.drawRoundedRect(QRectF(70, 154, 420, 5), 2, 2)
+    painter.setPen(QPen(QColor(CYAN), 3)); painter.drawLine(72, 156, 220, 156)
+    painter.end()
+    splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
+    splash.show(); app.processEvents()
     auth = authenticate()
     if auth is None:
+        splash.close()
         return 0
+    splash.showMessage("Loading canvas tools and local settings…", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter, QColor(TEXT))
+    app.processEvents()
     window = MainWindow(auth)
     window.show()
+    splash.finish(window)
     return app.exec()
 
 
