@@ -1,1 +1,2 @@
 secure notes system
+password = 123456789
