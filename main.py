@@ -17,6 +17,8 @@ import json
 import os
 import secrets
 import shutil
+import signal
+import subprocess
 import struct
 import sys
 import tempfile
@@ -41,7 +43,7 @@ try:
         QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
         QToolBar, QStatusBar, QColorDialog, QSpinBox, QComboBox, QTextEdit,
         QCheckBox, QInputDialog, QProgressDialog, QMenu, QSplitter, QFrame,
-        QFontComboBox, QSlider, QScrollArea, QGraphicsEffect, QPlainTextEdit, QDialogButtonBox, QSplashScreen
+        QFontComboBox, QSlider, QScrollArea, QGraphicsEffect, QPlainTextEdit, QDialogButtonBox, QSplashScreen, QSizePolicy
     )
 except ImportError as exc:
     print("Dasweic Notes needs PySide6. Install it with: python -m pip install PySide6 cryptography")
@@ -103,17 +105,21 @@ MAGIC = b"DASWEIC1"
 CHUNK = 1024 * 1024
 CONFIG_DIR = Path.home() / ".dasweic_notes"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
+# Persistent attachment vault lives beside main.py; only authenticated encrypted blobs
+# are kept here. Plaintext working copies are confined to the private session temp dir.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+VAULT_DIR = DATA_DIR / "attachments"
 DEFAULT_PASSWORD = "djsar"
 
-BG = "#080b13"
-PANEL = "#111827"
-PANEL2 = "#151e30"
-BORDER = "#28344b"
-TEXT = "#e5edf8"
-MUTED = "#9ba9c1"
-CYAN = "#71d9e8"
-VIOLET = "#b7a2ff"
-ACCENT = "#83d9e8"
+BG = "#000000"
+PANEL = "#080808"
+PANEL2 = "#101010"
+BORDER = "#292929"
+TEXT = "#f2f2f2"
+MUTED = "#929292"
+CYAN = "#e6e6e6"  # neutral monochrome highlight
+VIOLET = "#777777"  # neutral monochrome secondary shade
+ACCENT = "#ffffff"
 
 
 def derive_key(password: str, salt: bytes, length: int = 64) -> bytes:
@@ -243,9 +249,9 @@ def styled_button(text: str, primary: bool = False) -> QPushButton:
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     b.setMinimumHeight(34)
     if primary:
-        b.setStyleSheet("QPushButton{background:#246879;color:#f5fcff;border:1px solid #4aa8b7;border-radius:10px;padding:7px 14px;font-weight:600} QPushButton:hover{background:#2d7d8e} QPushButton:pressed{background:#174b59}")
+        b.setStyleSheet("QPushButton{background:#eeeeee;color:#050505;border:1px solid #ffffff;border-radius:8px;padding:7px 14px;font-weight:600} QPushButton:hover{background:#ffffff} QPushButton:pressed{background:#bdbdbd}")
     else:
-        b.setStyleSheet("QPushButton{background:#172236;color:#dce8f8;border:1px solid #33415b;border-radius:10px;padding:7px 12px} QPushButton:hover{background:#22324a;border-color:#6b9cae} QPushButton:focus{border:1px solid #83d9e8}")
+        b.setStyleSheet("QPushButton{background:#111111;color:#eeeeee;border:1px solid #303030;border-radius:8px;padding:7px 12px} QPushButton:hover{background:#242424;border-color:#666666} QPushButton:focus{border:1px solid #bdbdbd}")
     return b
 
 
@@ -300,8 +306,8 @@ class PasswordDialog(QDialog):
 DIALOG_STYLE = f"""
 QDialog {{ background:{PANEL}; color:{TEXT}; }}
 QLabel {{ color:{TEXT}; }}
-QLabel#dialogTitle {{ font-size:20px; font-weight:700; color:#dffaff; padding:5px 0; }}
-QLineEdit,QTextEdit,QComboBox,QSpinBox {{ background:#0b1220; color:{TEXT}; border:1px solid #33415b; border-radius:9px; padding:8px; selection-background-color:#286777; }}
+QLabel#dialogTitle {{ font-size:20px; font-weight:700; color:#f5f5f5; padding:5px 0; }}
+QLineEdit,QTextEdit,QComboBox,QSpinBox {{ background:#121212; color:{TEXT}; border:1px solid #404040; border-radius:9px; padding:8px; selection-background-color:#5b5b5b; }}
 QLineEdit:focus,QTextEdit:focus,QComboBox:focus {{ border:1px solid {CYAN}; }}
 """
 
@@ -321,13 +327,20 @@ class TextDialog(QDialog):
         self.editor.setPlaceholderText("Write your thoughts…\n\nMultiple paragraphs and Unicode are supported.")
         self.editor.setPlainText(data.get("text", ""))
         layout.addWidget(self.editor, 1)
+        editor_controls = QHBoxLayout()
+        editor_controls.addStretch()
+        self.fullscreen_btn = styled_button("⛶  Full screen")
+        self.fullscreen_btn.setToolTip("Toggle full-screen notepad (F11; Escape exits)")
+        self.fullscreen_btn.clicked.connect(self.toggle_editor_fullscreen)
+        editor_controls.addWidget(self.fullscreen_btn)
+        layout.addLayout(editor_controls)
         form = QHBoxLayout()
         self.font = QFontComboBox()
         self.font.setCurrentFont(QFont(data.get("font", "Noto Sans")))
         self.size = QSpinBox()
         self.size.setRange(7, 96)
         self.size.setValue(int(data.get("size", 18)))
-        self.color = QColor(data.get("color", "#e5edf8"))
+        self.color = QColor(data.get("color", "#ececec"))
         self.color_btn = styled_button("Text color")
         self.color_btn.clicked.connect(self.pick_color)
         self.bold = QCheckBox("Bold"); self.bold.setChecked(bool(data.get("bold", False)))
@@ -347,7 +360,28 @@ class TextDialog(QDialog):
         cancel.clicked.connect(self.reject); add.clicked.connect(self.accept)
         buttons.addWidget(cancel); buttons.addWidget(add); layout.addLayout(buttons)
         self.setStyleSheet(DIALOG_STYLE + f"QCheckBox{{color:{TEXT};padding:4px}}")
+        self._editor_fullscreen = False
+        self._normal_geometry = None
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_editor_fullscreen)
+        QShortcut(QKeySequence("Escape"), self, activated=self.exit_editor_fullscreen)
         self.editor.setFocus()
+
+    def toggle_editor_fullscreen(self):
+        if self._editor_fullscreen:
+            self.showNormal()
+            self._editor_fullscreen = False
+            self.fullscreen_btn.setText("⛶  Full screen")
+        else:
+            self.showFullScreen()
+            self._editor_fullscreen = True
+            self.fullscreen_btn.setText("⛶  Exit full screen")
+        self.editor.setFocus()
+
+    def exit_editor_fullscreen(self):
+        if self._editor_fullscreen:
+            self.showNormal()
+            self._editor_fullscreen = False
+            self.fullscreen_btn.setText("⛶  Full screen")
 
     def pick_color(self):
         c = QColorDialog.getColor(self.color, self, "Choose text color")
@@ -413,7 +447,7 @@ class FallbackPdfViewer(QWidget):
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        self.scroll.setStyleSheet(f"QScrollArea{{background:#202637;border:1px solid {BORDER};border-radius:10px}}")
+        self.scroll.setStyleSheet(f"QScrollArea{{background:#262626;border:1px solid {BORDER};border-radius:10px}}")
         self.page_image = QLabel()
         self.page_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.page_image.setStyleSheet("background:white;border:0;padding:8px")
@@ -548,16 +582,22 @@ class AttachmentViewer(QDialog):
                 self.audio_output = QAudioOutput(self)
                 self.player.setAudioOutput(self.audio_output)
                 if suffix in self.VIDEO_EXTS:
-                    self.video_widget = QVideoWidget(self)
+                    self.video_container = QWidget(self)
+                    self.video_container.setStyleSheet("background:#000000;border:1px solid #222222;border-radius:8px;")
+                    self.video_container_layout = QVBoxLayout(self.video_container)
+                    self.video_container_layout.setContentsMargins(0, 0, 0, 0)
+                    self.video_widget = QVideoWidget(self.video_container)
                     self.video_widget.setMinimumHeight(220)
-                    self.video_widget.setStyleSheet("background:#03060b;border:1px solid #26334a;border-radius:12px;")
+                    self.video_widget.setStyleSheet("background:#000000;border:0;border-radius:0;")
+                    self.video_container_layout.addWidget(self.video_widget)
                     self.player.setVideoOutput(self.video_widget)
-                    root.addWidget(self.video_widget, 1)
+                    root.addWidget(self.video_container, 1)
+                    self._video_fullscreen_window = None
                     self.video_widget.installEventFilter(self)
                 else:
                     visual = QFrame()
                     visual.setMinimumHeight(180)
-                    visual.setStyleSheet(f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {PANEL2},stop:1 #080d18);border:1px solid {BORDER};border-radius:14px;")
+                    visual.setStyleSheet(f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {PANEL2},stop:1 #0d0d0d);border:1px solid {BORDER};border-radius:14px;")
                     visual_layout = QVBoxLayout(visual)
                     glyph = QLabel("♫")
                     glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -647,7 +687,7 @@ class AttachmentViewer(QDialog):
         close.clicked.connect(self.accept)
         footer.addWidget(close)
         root.addLayout(footer)
-        self.setStyleSheet(DIALOG_STYLE + f"QLabel{{color:{TEXT}}} QSlider::groove:horizontal{{height:5px;background:#28344b;border-radius:2px}} QSlider::sub-page:horizontal{{background:{CYAN};border-radius:2px}} QSlider::handle:horizontal{{background:#f3fcff;border:2px solid {CYAN};width:12px;margin:-5px 0;border-radius:7px}} QComboBox{{background:{PANEL2};color:{TEXT};border:1px solid {BORDER};border-radius:8px;padding:6px}}")
+        self.setStyleSheet(DIALOG_STYLE + f"QLabel{{color:{TEXT}}} QSlider::groove:horizontal{{height:5px;background:#333333;border-radius:2px}} QSlider::sub-page:horizontal{{background:{CYAN};border-radius:2px}} QSlider::handle:horizontal{{background:#fafafa;border:2px solid {CYAN};width:12px;margin:-5px 0;border-radius:7px}} QComboBox{{background:{PANEL2};color:{TEXT};border:1px solid {BORDER};border-radius:8px;padding:6px}}")
 
         # Dialog-local keyboard controls work while the player window is focused.
         self._shortcuts = []
@@ -706,16 +746,28 @@ class AttachmentViewer(QDialog):
             return
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.play_button.setText("❚❚  Pause" if playing else "▶  Play")
+        if getattr(self, "_fs_play_button", None) is not None:
+            self._fs_play_button.setText("❚❚  Pause" if playing else "▶  Play")
         self.status_label.setText("PLAYING" if playing else "PAUSED" if state == QMediaPlayer.PlaybackState.PausedState else "READY")
 
     def duration_changed(self, duration):
-        self.position.setRange(0, max(0, duration))
+        duration = max(0, int(duration))
+        self.position.setRange(0, duration)
         self.total_time.setText(self._fmt(duration))
+        if getattr(self, "_fs_position", None) is not None:
+            self._fs_position.setRange(0, duration)
+        if getattr(self, "_fs_total_time", None) is not None:
+            self._fs_total_time.setText(self._fmt(duration))
 
     def position_changed(self, position):
         if not self.position.isSliderDown():
             self.position.setValue(position)
         self.current_time.setText(self._fmt(position))
+        if getattr(self, "_fs_position", None) is not None:
+            if not self._fs_position.isSliderDown():
+                self._fs_position.setValue(position)
+        if getattr(self, "_fs_current_time", None) is not None:
+            self._fs_current_time.setText(self._fmt(position))
 
     def _fmt(self, ms):
         seconds = max(0, int(ms / 1000))
@@ -740,22 +792,29 @@ class AttachmentViewer(QDialog):
 
     def set_volume(self, value):
         if self.audio_output:
+            value = max(0, min(100, int(value)))
             self.audio_output.setVolume(value / 100.0)
-            self.mute_button.setText("🔇" if value == 0 else "🔈" if value < 35 else "🔉" if value < 70 else "🔊")
+            icon = "🔇" if value == 0 else "🔈" if value < 35 else "🔉" if value < 70 else "🔊"
+            self.mute_button.setText(icon)
+            if getattr(self, "_fs_volume", None) is not None and self._fs_volume.value() != value:
+                self._fs_volume.setValue(value)
+            if getattr(self, "_fs_mute_button", None) is not None:
+                self._fs_mute_button.setText("Unmute" if self.audio_output.isMuted() else icon)
 
     def toggle_mute(self):
         if not self.audio_output:
             return
-        if self.audio_output.isMuted():
-            self.audio_output.setMuted(False)
-            self.mute_button.setText("🔊")
-        else:
-            self.audio_output.setMuted(True)
-            self.mute_button.setText("🔇")
+        muted = not self.audio_output.isMuted()
+        self.audio_output.setMuted(muted)
+        self.mute_button.setText("🔇" if muted else "🔊")
+        if getattr(self, "_fs_mute_button", None) is not None:
+            self._fs_mute_button.setText("Unmute" if muted else "Mute")
 
     def set_speed(self, index):
         if self.player and index >= 0:
             self.player.setPlaybackRate(float(self.speed.itemData(index)))
+            if getattr(self, "_fs_speed", None) is not None and self._fs_speed.currentIndex() != index:
+                self._fs_speed.setCurrentIndex(index)
 
     def media_status_changed(self, status):
         if not hasattr(self, "status_label"):
@@ -775,21 +834,154 @@ class AttachmentViewer(QDialog):
             self.message_label.setText(f"Playback error: {error_string}. Codec support depends on your OS and Qt Multimedia backend.")
 
     def toggle_fullscreen(self):
+        """Move the existing video surface into a native, controllable fullscreen window."""
         if not self.video_widget:
             return
-        if self.isFullScreen():
-            self.showNormal()
-            self.video_widget.setParent(self)
-        else:
-            self.showFullScreen()
+        if self._video_fullscreen_window is not None:
+            self._exit_video_fullscreen()
+            return
+
+        self.video_container_layout.removeWidget(self.video_widget)
+        window = QWidget(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        window.setObjectName("DasweicVideoFullscreen")
+        window.setWindowTitle(f"Dasweic Media Player · {self.path.name}")
+        window.setStyleSheet("QWidget#DasweicVideoFullscreen { background:#000000; color:#ffffff; } QLabel { color:#ffffff; background:transparent; } QPushButton { background:#111111; color:#ffffff; border:1px solid #444444; border-radius:5px; padding:7px 11px; } QPushButton:hover { background:#222222; border-color:#777777; } QSlider::groove:horizontal { height:5px; background:#333333; border-radius:2px; } QSlider::sub-page:horizontal { background:#aaaaaa; } QSlider::handle:horizontal { background:#ffffff; border:1px solid #000000; width:12px; margin:-5px 0; border-radius:6px; } QComboBox { background:#111111; color:#ffffff; border:1px solid #444444; padding:5px; }")
+        window.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        full_layout = QVBoxLayout(window)
+        full_layout.setContentsMargins(0, 0, 0, 0)
+        full_layout.setSpacing(0)
+
+        self.video_widget.setParent(window)
+        self.video_widget.setMinimumSize(0, 0)
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        full_layout.addWidget(self.video_widget, 1)
+
+        # Dedicated fullscreen transport controls; they control the same QMediaPlayer.
+        controls_panel = QWidget(window)
+        controls_panel.setStyleSheet("background:#080808; border-top:1px solid #292929;")
+        controls_layout = QVBoxLayout(controls_panel)
+        controls_layout.setContentsMargins(18, 8, 18, 10)
+        controls_layout.setSpacing(6)
+        seek_row = QHBoxLayout()
+        self._fs_current_time = QLabel("00:00")
+        self._fs_total_time = QLabel("00:00")
+        for label in (self._fs_current_time, self._fs_total_time):
+            label.setMinimumWidth(58)
+            label.setStyleSheet("color:#dddddd; font-size:11px; font-variant-numeric:tabular-nums;")
+        self._fs_position = QSlider(Qt.Orientation.Horizontal, controls_panel)
+        self._fs_position.setRange(0, max(0, self.player.duration() if self.player else 0))
+        self._fs_position.setValue(max(0, self.player.position() if self.player else 0))
+        self._fs_position.setToolTip("Seek through video")
+        self._fs_position.sliderPressed.connect(self._begin_seek)
+        self._fs_position.sliderReleased.connect(self._finish_fullscreen_seek)
+        self._fs_position.sliderMoved.connect(lambda value: self._fs_current_time.setText(self._fmt(value)))
+        seek_row.addWidget(self._fs_current_time)
+        seek_row.addWidget(self._fs_position, 1)
+        seek_row.addWidget(self._fs_total_time)
+        controls_layout.addLayout(seek_row)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        self._fs_back_button = QPushButton("−10s", controls_panel)
+        self._fs_play_button = QPushButton("❚❚  Pause" if self.player and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState else "▶  Play", controls_panel)
+        self._fs_forward_button = QPushButton("+10s", controls_panel)
+        self._fs_stop_button = QPushButton("■  Stop", controls_panel)
+        self._fs_back_button.clicked.connect(lambda: self.seek_relative(-10000))
+        self._fs_play_button.clicked.connect(self.toggle_play)
+        self._fs_forward_button.clicked.connect(lambda: self.seek_relative(10000))
+        self._fs_stop_button.clicked.connect(self.stop_playback)
+        for button in (self._fs_back_button, self._fs_play_button, self._fs_forward_button, self._fs_stop_button):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+        self._fs_mute_button = QPushButton("Unmute" if self.audio_output and self.audio_output.isMuted() else "Mute", controls_panel)
+        self._fs_mute_button.clicked.connect(self.toggle_mute)
+        self._fs_volume = QSlider(Qt.Orientation.Horizontal, controls_panel)
+        self._fs_volume.setRange(0, 100)
+        self._fs_volume.setValue(self.volume.value())
+        self._fs_volume.setFixedWidth(120)
+        self._fs_volume.setToolTip("Volume")
+        self._fs_volume.valueChanged.connect(self.set_volume)
+        button_row.addWidget(self._fs_mute_button)
+        button_row.addWidget(self._fs_volume)
+        button_row.addWidget(QLabel("Speed", controls_panel))
+        self._fs_speed = QComboBox(controls_panel)
+        for rate in (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0):
+            self._fs_speed.addItem(f"{rate:g}×", rate)
+        self._fs_speed.setCurrentIndex(self.speed.currentIndex())
+        self._fs_speed.currentIndexChanged.connect(self._set_fullscreen_speed)
+        self._fs_speed.setFixedWidth(76)
+        button_row.addWidget(self._fs_speed)
+        self._fs_exit_button = QPushButton("✕  Exit fullscreen", controls_panel)
+        self._fs_exit_button.setToolTip("Exit fullscreen (Esc or F)")
+        self._fs_exit_button.clicked.connect(self._exit_video_fullscreen)
+        button_row.addWidget(self._fs_exit_button)
+        controls_layout.addLayout(button_row)
+        full_layout.addWidget(controls_panel, 0)
+
+        self._video_fullscreen_window = window
+        self._fs_shortcuts = []
+        for key, callback in (("Escape", self._exit_video_fullscreen), ("F", self._exit_video_fullscreen), ("Space", self.toggle_play), ("Left", lambda: self.seek_relative(-5000)), ("Right", lambda: self.seek_relative(5000)), ("Up", lambda: self.volume.setValue(min(100, self.volume.value() + 5))), ("Down", lambda: self.volume.setValue(max(0, self.volume.value() - 5))), ("M", self.toggle_mute)):
+            shortcut = QShortcut(QKeySequence(key), window)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self._fs_shortcuts.append(shortcut)
+        window.installEventFilter(self)
+        screen = self.windowHandle().screen() if self.windowHandle() else QGuiApplication.primaryScreen()
+        if screen is not None:
+            window.setGeometry(screen.geometry())
+        window.showFullScreen()
+        window.raise_()
+        window.activateWindow()
+        self.video_widget.show()
+        window.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+    def _finish_fullscreen_seek(self):
+        if self.player and getattr(self, "_fs_position", None) is not None:
+            self.player.setPosition(self._fs_position.value())
+        self._seeking = False
+
+    def _set_fullscreen_speed(self, index):
+        if index >= 0 and self.player:
+            rate = float(self._fs_speed.itemData(index))
+            self.player.setPlaybackRate(rate)
+            if self.speed.currentIndex() != index:
+                self.speed.setCurrentIndex(index)
+
+    def _exit_video_fullscreen(self):
+        window = getattr(self, "_video_fullscreen_window", None)
+        if window is None:
+            return
+        # Clear the reference first so close events and shortcuts cannot recurse.
+        self._video_fullscreen_window = None
+        self.video_widget.setParent(self.video_container)
+        self.video_widget.setMinimumHeight(220)
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_container_layout.addWidget(self.video_widget)
+        for name in ("_fs_position", "_fs_current_time", "_fs_total_time", "_fs_play_button", "_fs_volume", "_fs_mute_button", "_fs_speed", "_fs_shortcuts", "_fs_exit_button", "_fs_back_button", "_fs_forward_button", "_fs_stop_button"):
+            if hasattr(self, name):
+                delattr(self, name)
+        window.removeEventFilter(self)
+        window.close()
+        window.deleteLater()
+        self.video_container.show()
+        self.video_widget.show()
+        self.activateWindow()
+        self.raise_()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def eventFilter(self, watched, event):
-        if watched is self.video_widget and event.type() == QEvent.Type.MouseButtonDblClick:
+        if event.type() == QEvent.Type.MouseButtonDblClick and watched is self.video_widget:
             self.toggle_fullscreen()
             return True
+        if watched is getattr(self, "_video_fullscreen_window", None) and event.type() == QEvent.Type.Close:
+            # The fullscreen surface is frameless, but handle WM close requests defensively.
+            QTimer.singleShot(0, self._exit_video_fullscreen)
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event):
+        if getattr(self, "_video_fullscreen_window", None) is not None:
+            self._exit_video_fullscreen()
         if self.player is not None:
             self.player.stop()
             self.player.setSource(QUrl())
@@ -809,7 +1001,7 @@ class CanvasItem(QGraphicsItem):
         self.w = float(data.get("w", 240))
         self.h = float(data.get("h", 130))
         self.stroke = QColor(data.get("stroke", CYAN))
-        self.fill = QColor(data.get("fill", "#142033"))
+        self.fill = QColor(data.get("fill", "#1f1f1f"))
         self.width = float(data.get("width", 3))
         self.points = [QPointF(float(p[0]), float(p[1])) for p in data.get("points", [])]
         self.pixmap = QPixmap()
@@ -873,7 +1065,7 @@ class CanvasItem(QGraphicsItem):
             painter.drawRoundedRect(QRectF(0, 0, self.w, self.h), 8, 8)
             painter.drawPixmap(QRectF(0, 0, self.w, self.h), self.pixmap, QRectF(self.pixmap.rect()))
         elif self.kind in ("file", "image", "audio", "video", "pdf", "link"):
-            painter.setBrush(QBrush(QColor("#121e30")))
+            painter.setBrush(QBrush(QColor("#1d1d1d")))
             painter.setPen(QPen(QColor(BORDER), 1))
             painter.drawRoundedRect(QRectF(0, 0, self.w, self.h), 12, 12)
             icon = {"file": "▤", "image": "▧", "audio": "♫", "video": "▶", "pdf": "PDF", "link": "↗"}.get(self.kind, "▤")
@@ -891,7 +1083,7 @@ class CanvasItem(QGraphicsItem):
             painter.drawRoundedRect(self.boundingRect().adjusted(2, 2, -2, -2), 8, 8)
             if self.kind == "image":
                 # Visible bottom-right resize grip.
-                painter.setPen(QPen(QColor("#07111d"), 1))
+                painter.setPen(QPen(QColor("#101010"), 1))
                 painter.setBrush(QBrush(QColor(CYAN)))
                 painter.drawRoundedRect(QRectF(self.w - 7, self.h - 7, 14, 14), 3, 3)
 
@@ -946,7 +1138,7 @@ class CanvasView(QGraphicsView):
         super().__init__(scene, parent)
         self.tool = "select"
         self.stroke_color = QColor(CYAN)
-        self.fill_color = QColor("#17243a")
+        self.fill_color = QColor("#232323")
         self.stroke_width = 3
         self._panning = False
         self._drawing = False
@@ -1099,7 +1291,7 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton and self.tool in ("pencil", "highlighter", "eraser"):
             self._drawing = True
             kind = "highlighter" if self.tool == "highlighter" else "stroke"
-            color = QColor("#080b13") if self.tool == "eraser" else self.stroke_color
+            color = QColor("#0b0b0b") if self.tool == "eraser" else self.stroke_color
             item = CanvasItem(kind, {"x": pos.x(), "y": pos.y(), "points": [[0, 0]],
                                      "stroke": color.name(), "width": self.stroke_width * (3 if self.tool == "eraser" else 1)})
             item.setPos(pos); self.scene().addItem(item); self._preview = item
@@ -1259,8 +1451,15 @@ class TextAttachmentViewer(QDialog):
         layout.addWidget(heading)
         self.editor = QPlainTextEdit()
         self.editor.setReadOnly(True)
-        self.editor.setStyleSheet(f"background:#090e19;color:{TEXT};border:1px solid {BORDER};border-radius:10px;padding:10px;font-family:monospace;")
+        self.editor.setStyleSheet(f"background:#0e0e0e;color:{TEXT};border:1px solid {BORDER};border-radius:10px;padding:10px;font-family:monospace;")
         layout.addWidget(self.editor, 1)
+        self.fullscreen_btn = styled_button("⛶  Full screen")
+        self.fullscreen_btn.setToolTip("Toggle full-screen text preview (F11; Escape exits)")
+        self.fullscreen_btn.clicked.connect(self.toggle_preview_fullscreen)
+        layout.addWidget(self.fullscreen_btn, 0, Qt.AlignmentFlag.AlignRight)
+        self._preview_fullscreen = False
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_preview_fullscreen)
+        QShortcut(QKeySequence("Escape"), self, activated=self.exit_preview_fullscreen)
         try:
             size = self.path.stat().st_size
             with self.path.open("rb") as f:
@@ -1286,6 +1485,23 @@ class TextAttachmentViewer(QDialog):
         close.clicked.connect(self.accept)
         layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
         self.setStyleSheet(DIALOG_STYLE)
+
+    def toggle_preview_fullscreen(self):
+        if self._preview_fullscreen:
+            self.showNormal()
+            self._preview_fullscreen = False
+            self.fullscreen_btn.setText("⛶  Full screen")
+        else:
+            self.showFullScreen()
+            self._preview_fullscreen = True
+            self.fullscreen_btn.setText("⛶  Exit full screen")
+        self.editor.setFocus()
+
+    def exit_preview_fullscreen(self):
+        if self._preview_fullscreen:
+            self.showNormal()
+            self._preview_fullscreen = False
+            self.fullscreen_btn.setText("⛶  Full screen")
 
 
 class CaptureDialog(QDialog):
@@ -1323,7 +1539,7 @@ class CaptureDialog(QDialog):
         self.preview_label = QLabel("Audio capture" if mode == "audio" else "Camera preview will appear here" if mode == "camera" else "Screen capture selected")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(250)
-        self.preview_label.setStyleSheet(f"background:#050912;border:1px solid {BORDER};border-radius:12px;color:{MUTED};padding:10px")
+        self.preview_label.setStyleSheet(f"background:#090909;border:1px solid {BORDER};border-radius:12px;color:{MUTED};padding:10px")
         root.addWidget(self.preview_label, 1)
         device_row = QHBoxLayout()
         device_row.addWidget(QLabel("Microphone"))
@@ -1535,10 +1751,390 @@ class CaptureDialog(QDialog):
         event.accept()
 
 
+
+
+class AndroidCameraCaptureDialog(QDialog):
+    """Record the Android phone camera and phone microphone using ADB + scrcpy.
+
+    The live camera preview is provided by scrcpy in its own window. The audio
+    source is explicitly set to the phone microphone (not the laptop microphone).
+    """
+    completed = Signal(str)
+
+    def __init__(self, output_path: Path, parent=None):
+        super().__init__(parent)
+        self.output_path = Path(output_path)
+        self.process = None
+        self._finishing = False
+        self._cancelled = False
+        self._started_at = None
+        self._log_handle = None
+        self._last_error = ""
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(250)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(300)
+        self._poll_timer.timeout.connect(self._poll_process)
+
+        self.setWindowTitle("Dasweic Notes · Android camera recorder")
+        self.resize(650, 370)
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+
+        heading = QLabel("ANDROID CAMERA + PHONE MICROPHONE")
+        heading.setStyleSheet(f"font-size:17px;font-weight:800;color:{TEXT}")
+        root.addWidget(heading)
+
+        info = QLabel(
+            "Live preview opens in a separate scrcpy window. The recording uses the "
+            "Android phone's selected camera and phone microphone only; the laptop "
+            "microphone is not selected by this recorder."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{MUTED}")
+        root.addWidget(info)
+
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("USB device"))
+        self.device_combo = QComboBox()
+        device_row.addWidget(self.device_combo, 1)
+        self.refresh_button = styled_button("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_devices)
+        device_row.addWidget(self.refresh_button)
+        root.addLayout(device_row)
+
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(QLabel("Phone camera"))
+        self.facing_combo = QComboBox()
+        self.facing_combo.addItem("Rear camera", "back")
+        self.facing_combo.addItem("Front camera", "front")
+        settings_row.addWidget(self.facing_combo, 1)
+        settings_row.addWidget(QLabel("Quality"))
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItem("720p · smaller file", "1280x720")
+        self.quality_combo.addItem("1080p · high quality", "1920x1080")
+        self.quality_combo.addItem("Native · phone default", "native")
+        self.quality_combo.setCurrentIndex(1)
+        settings_row.addWidget(self.quality_combo, 1)
+        root.addLayout(settings_row)
+
+        self.status_label = QLabel("Checking ADB and scrcpy…")
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(38)
+        self.status_label.setStyleSheet(
+            f"color:{CYAN};font-weight:600;background:{PANEL2};"
+            f"border:1px solid {BORDER};border-radius:8px;padding:8px"
+        )
+        root.addWidget(self.status_label)
+
+        self.elapsed_label = QLabel("00:00")
+        self.elapsed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.elapsed_label.setStyleSheet(f"font-size:27px;font-weight:800;color:{CYAN}")
+        root.addWidget(self.elapsed_label)
+
+        buttons = QHBoxLayout()
+        self.start_button = styled_button("●  Start recording", True)
+        self.stop_button = styled_button("■  Stop & attach")
+        self.cancel_button = styled_button("Cancel")
+        buttons.addWidget(self.start_button)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.cancel_button)
+        root.addLayout(buttons)
+
+        self.stop_button.setEnabled(False)
+        self.start_button.clicked.connect(self.start_recording)
+        self.stop_button.clicked.connect(self.stop_recording)
+        self.cancel_button.clicked.connect(self.cancel_recording)
+        self.setStyleSheet(DIALOG_STYLE)
+        self.refresh_devices()
+
+    @staticmethod
+    def _find_program(name):
+        from shutil import which
+        return which(name)
+
+    def _set_idle_controls(self, idle=True):
+        self.start_button.setEnabled(idle and self.device_combo.count() > 0)
+        self.refresh_button.setEnabled(idle)
+        self.device_combo.setEnabled(idle)
+        self.facing_combo.setEnabled(idle)
+        self.quality_combo.setEnabled(idle)
+        self.stop_button.setEnabled(not idle)
+
+    def refresh_devices(self):
+        if self.process is not None:
+            return
+        self.device_combo.clear()
+        adb = self._find_program("adb")
+        scrcpy = self._find_program("scrcpy")
+        missing = [name for name, found in (("adb", adb), ("scrcpy", scrcpy)) if not found]
+        if missing:
+            self.status_label.setText(
+                "Missing: " + ", ".join(missing) +
+                ". Install on Ubuntu with: sudo apt update && sudo apt install adb scrcpy"
+            )
+            self.start_button.setEnabled(False)
+            return
+
+        try:
+            result = subprocess.run(
+                [adb, "devices", "-l"], capture_output=True, text=True,
+                timeout=7, check=False
+            )
+            devices, pending = [], []
+            for line in result.stdout.splitlines()[1:]:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    if parts[1] == "device":
+                        devices.append((parts[0], " ".join(parts[2:]) or parts[0]))
+                    elif parts[1] in ("unauthorized", "offline"):
+                        pending.append((parts[0], parts[1]))
+
+            for serial, description in devices:
+                self.device_combo.addItem(f"{serial}  ·  {description}", serial)
+
+            if devices:
+                self.status_label.setText(
+                    "Phone connected. Unlock it and approve the USB debugging prompt if requested. "
+                    "Press Start to open the live preview."
+                )
+                self.start_button.setEnabled(True)
+            elif pending:
+                self.status_label.setText(
+                    "Phone detected but not authorized/offline. Unlock the phone, approve the USB debugging "
+                    "RSA prompt, then press Refresh."
+                )
+                self.start_button.setEnabled(False)
+            else:
+                self.status_label.setText(
+                    "No authorized phone found. Connect USB, enable Developer options → USB debugging, "
+                    "approve the prompt on the phone, then press Refresh."
+                )
+                self.start_button.setEnabled(False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.status_label.setText(f"Could not query ADB: {exc}")
+            self.start_button.setEnabled(False)
+
+    def start_recording(self):
+        if self.process is not None:
+            return
+
+        adb = self._find_program("adb")
+        scrcpy = self._find_program("scrcpy")
+        serial = self.device_combo.currentData()
+        if not adb or not scrcpy or not serial:
+            QMessageBox.warning(
+                self, APP_NAME,
+                "Install adb and scrcpy, connect an authorized phone, and refresh the device list."
+            )
+            return
+
+        try:
+            # Check options before starting so older/incompatible scrcpy builds give
+            # a useful message rather than silently recording the wrong source.
+            help_result = subprocess.run(
+                [scrcpy, "--help"], capture_output=True, text=True,
+                timeout=8, check=False
+            )
+            help_text = (help_result.stdout or "") + "\n" + (help_result.stderr or "")
+            required_options = ("--video-source", "--camera-facing", "--audio-source", "--record")
+            unsupported = [option for option in required_options if option not in help_text]
+            if unsupported:
+                raise RuntimeError(
+                    "Your scrcpy version does not advertise the required camera-recording options "
+                    f"({', '.join(unsupported)}). Update scrcpy and try again."
+                )
+
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.output_path.unlink(missing_ok=True)
+
+            command = [
+                scrcpy,
+                "--serial", str(serial),
+                "--video-source=camera",
+                "--camera-facing=" + str(self.facing_combo.currentData()),
+                # Explicitly select the Android handset microphone. No host/laptop
+                # audio input is opened by this application.
+                "--audio-source=mic",
+                "--video-codec=h264",
+                "--audio-codec=aac",
+                "--record", str(self.output_path),
+                "--record-format=mp4",
+                "--window-title=Dasweic Notes — Android Camera Preview",
+            ]
+
+            quality = self.quality_combo.currentData()
+            if quality != "native":
+                command.append("--camera-size=" + str(quality))
+
+            log_path = self.output_path.with_suffix(self.output_path.suffix + ".scrcpy.log")
+            self._log_handle = log_path.open("w", encoding="utf-8")
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=self._log_handle,
+                start_new_session=True,
+            )
+            self._started_at = time.monotonic()
+            self._finishing = False
+            self._cancelled = False
+            self._elapsed_timer.start()
+            self._poll_timer.start()
+            self._set_idle_controls(False)
+            self.status_label.setText(
+                "STARTING… Opening phone camera and phone microphone. "
+                "Keep the separate scrcpy preview window visible."
+            )
+            QTimer.singleShot(1200, self._show_recording_hint)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            self._close_log()
+            self.process = None
+            QMessageBox.warning(self, APP_NAME, f"Could not start Android recording.\n\n{exc}")
+
+    def _show_recording_hint(self):
+        if self.process is not None and self.process.poll() is None and not self._finishing:
+            self.status_label.setText(
+                "● RECORDING · Phone camera + phone microphone · Live preview is in the scrcpy window"
+            )
+
+    def _update_elapsed(self):
+        if self._started_at is not None:
+            seconds = max(0, int(time.monotonic() - self._started_at))
+            minutes, secs = divmod(seconds, 60)
+            hours, minutes = divmod(minutes, 60)
+            self.elapsed_label.setText(
+                f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+            )
+
+    def stop_recording(self):
+        if self.process is None or self._finishing:
+            return
+        self._finishing = True
+        self.status_label.setText("STOPPING · Finalizing MP4… please wait")
+        self.stop_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        try:
+            # SIGINT allows scrcpy to finalize the MP4 container correctly.
+            self.process.send_signal(signal.SIGINT)
+        except (OSError, ProcessLookupError):
+            pass
+        self._poll_timer.start()
+
+    def _close_log(self):
+        if self._log_handle is not None:
+            try:
+                self._log_handle.flush()
+                self._log_handle.close()
+            except OSError:
+                pass
+            self._log_handle = None
+
+    def _read_diagnostics(self):
+        self._close_log()
+        log_path = self.output_path.with_suffix(self.output_path.suffix + ".scrcpy.log")
+        try:
+            return log_path.read_text(encoding="utf-8", errors="replace")[-6000:]
+        except OSError:
+            return ""
+
+    def _poll_process(self):
+        if self.process is None:
+            return
+        code = self.process.poll()
+        if code is None:
+            return
+
+        self._poll_timer.stop()
+        self._elapsed_timer.stop()
+        self.process = None
+        diagnostics = self._read_diagnostics()
+
+        if self._cancelled:
+            self.output_path.unlink(missing_ok=True)
+            self.reject()
+            return
+
+        valid_file = self.output_path.is_file() and self.output_path.stat().st_size > 0
+        if self._finishing and valid_file:
+            self.status_label.setText("Recording saved. Attaching video to the canvas…")
+            self.cancel_button.setEnabled(True)
+            self.completed.emit(str(self.output_path))
+            try:
+                self.output_path.with_suffix(self.output_path.suffix + ".scrcpy.log").unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.accept()
+            return
+
+        self._set_idle_controls(True)
+        self.cancel_button.setEnabled(True)
+        self._started_at = None
+        self.elapsed_label.setText("00:00")
+        message = (
+            "scrcpy ended without a finalized recording. Check scrcpy compatibility, Android camera "
+            "support, and the phone's microphone permission. The requested source was explicitly "
+            "the phone camera plus --audio-source=mic."
+        )
+        if diagnostics.strip():
+            message += "\n\nscrcpy diagnostics:\n" + diagnostics.strip()
+        self.status_label.setText("RECORDING FAILED")
+        QMessageBox.warning(self, APP_NAME, message)
+
+    def cancel_recording(self):
+        self._cancelled = True
+        self._elapsed_timer.stop()
+        self._poll_timer.stop()
+        if self.process is not None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=1)
+                except Exception:
+                    pass
+            self.process = None
+        self._close_log()
+        try:
+            self.output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.reject()
+
+    def closeEvent(self, event):
+        if self.process is not None:
+            answer = QMessageBox.question(
+                self, APP_NAME,
+                "Recording is active. Stop and discard this recording?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.cancel_recording()
+        else:
+            self._close_log()
+        event.accept()
+
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, auth_data: dict):
+    def __init__(self, auth_data: dict, storage_password: str):
         super().__init__()
         self.auth_data = auth_data
+        self.storage_password = storage_password
+        self.data_dir = DATA_DIR
+        self.vault_dir = VAULT_DIR
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.data_dir, 0o700)
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
         self.project_path: Path | None = None
         self.dirty = False
         self.project_password: str | None = None
@@ -1570,67 +2166,143 @@ class MainWindow(QMainWindow):
 
     def build_layout(self):
         root = QWidget()
-        layout = QVBoxLayout(root); layout.setContentsMargins(12, 10, 12, 8); layout.setSpacing(8)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(8, 7, 8, 7)
+        layout.setSpacing(6)
+
+        # One minimal top panel: identity/project controls plus a horizontally scrollable tool strip.
+        top_panel = QFrame()
+        top_panel.setObjectName("topPanel")
+        top_layout = QVBoxLayout(top_panel)
+        top_layout.setContentsMargins(10, 7, 10, 7)
+        top_layout.setSpacing(6)
+
         header = QHBoxLayout()
+        header.setSpacing(8)
         logo = QLabel("✦")
-        logo.setStyleSheet(f"color:{CYAN};font-size:27px;font-weight:800;padding:0 7px;")
-        title_box = QVBoxLayout()
-        title = QLabel("DASWEIC NOTES"); title.setStyleSheet("font-size:16px;font-weight:800;letter-spacing:2px;color:#eaf7ff")
-        subtitle = QLabel("PRIVATE COSMIC WORKSPACE  ·  OFFLINE"); subtitle.setStyleSheet(f"font-size:9px;letter-spacing:1.3px;color:{MUTED}")
-        title_box.addWidget(title); title_box.addWidget(subtitle)
-        header.addWidget(logo); header.addLayout(title_box); header.addStretch()
+        logo.setStyleSheet("color:#ffffff;font-size:20px;font-weight:800;padding:0 3px;")
+        title = QLabel("DASWEIC NOTES")
+        title.setStyleSheet("font-size:13px;font-weight:800;letter-spacing:1.5px;color:#f2f2f2")
+        header.addWidget(logo)
+        header.addWidget(title)
+        header.addSpacing(8)
         self.project_label = QLabel("Untitled canvas")
-        self.project_label.setStyleSheet(f"color:{MUTED};padding:8px 12px;border:1px solid {BORDER};border-radius:10px;")
+        self.project_label.setMinimumWidth(100)
+        self.project_label.setStyleSheet(f"color:{MUTED};padding:5px 8px;border:1px solid {BORDER};border-radius:6px;")
         header.addWidget(self.project_label)
-        header.addWidget(styled_button("New", False))
-        header.itemAt(header.count()-1).widget().clicked.connect(self.new_project)
-        save_btn = styled_button("Save", True); save_btn.clicked.connect(self.save_project); header.addWidget(save_btn)
-        layout.addLayout(header)
-        toolbar = QHBoxLayout(); toolbar.setSpacing(6)
-        for label, tool in [("Select","select"),("Text","text"),("Pencil","pencil"),("Highlight","highlighter"),
-                            ("Eraser","eraser"),("Line","line"),("Arrow","arrow"),("Rectangle","rect"),
-                            ("Rounded","roundrect"),("Ellipse","ellipse")]:
-            b = styled_button(label)
-            b.clicked.connect(lambda checked=False, t=tool: self.toolbar_action(t))
-            toolbar.addWidget(b)
-        toolbar.addStretch()
-        zoomout = styled_button("−"); zoomout.clicked.connect(lambda: self.zoom(1/1.15)); toolbar.addWidget(zoomout)
-        zoomin = styled_button("+"); zoomin.clicked.connect(lambda: self.zoom(1.15)); toolbar.addWidget(zoomin)
-        reset = styled_button("100%"); reset.clicked.connect(self.reset_zoom); toolbar.addWidget(reset)
-        layout.addLayout(toolbar)
-        body = QHBoxLayout(); body.setSpacing(10)
-        sidebar = QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(205)
-        side = QVBoxLayout(sidebar); side.setContentsMargins(12, 14, 12, 14); side.setSpacing(8)
-        side.addWidget(self.section_label("CREATE"))
-        for label, fn in [("＋  Add text", self.add_text), ("▧  Insert files", self.choose_files),
-                          ("⇩  Export files", self.export_files),
-                          ("↗  Add offline link", self.add_link), ("▱  Rectangle", lambda: self.set_tool("rect")),
-                          ("✎  Freehand pencil", lambda: self.set_tool("pencil"))]:
-            b = styled_button(label); b.clicked.connect(fn); side.addWidget(b)
-        side.addWidget(self.section_label("CAPTURE"))
-        for label, mode in [("●  Record audio", "audio"), ("▣  Camera + mic", "camera"), ("▤  Record screen", "screen")]:
-            b = styled_button(label); b.clicked.connect(lambda checked=False, m=mode: self.start_capture(m)); side.addWidget(b)
-        side.addWidget(self.section_label("STYLE"))
-        color_btn = styled_button("Stroke color"); color_btn.clicked.connect(self.choose_stroke); side.addWidget(color_btn)
-        fill_btn = styled_button("Shape fill"); fill_btn.clicked.connect(self.choose_fill); side.addWidget(fill_btn)
-        side.addWidget(QLabel("Stroke width"))
-        self.width_slider = QSlider(Qt.Orientation.Horizontal); self.width_slider.setRange(1, 18); self.width_slider.setValue(3)
-        self.width_slider.valueChanged.connect(lambda v: setattr(self.view, "stroke_width", v)); side.addWidget(self.width_slider)
-        side.addWidget(self.section_label("WORKSPACE"))
-        for label, fn in [("Duplicate  Ctrl+D", self.duplicate_selected), ("Delete selection", self.delete_selected),
-                          ("Bring to front", lambda: self.order_selected(True)), ("Send to back", lambda: self.order_selected(False)),
-                          ("Undo  Ctrl+Z", self.undo), ("Redo  Ctrl+Y", self.redo)]:
-            b = styled_button(label); b.clicked.connect(fn); side.addWidget(b)
-        side.addStretch()
-        self.autosave_check = QCheckBox("Enable local autosave")
+        new_btn = styled_button("New")
+        new_btn.clicked.connect(self.new_project)
+        header.addWidget(new_btn)
+        open_btn = styled_button("Open")
+        open_btn.clicked.connect(self.open_project)
+        header.addWidget(open_btn)
+        save_btn = styled_button("Save")
+        save_btn.clicked.connect(self.save_project)
+        header.addWidget(save_btn)
+        save_as_btn = styled_button("Save As")
+        save_as_btn.clicked.connect(self.save_as)
+        header.addWidget(save_as_btn)
+        header.addStretch(1)
+        self.fullscreen_canvas_btn = styled_button("⛶ Canvas")
+        self.fullscreen_canvas_btn.setToolTip("Toggle canvas full screen (F11; Escape exits)")
+        self.fullscreen_canvas_btn.clicked.connect(self.toggle_canvas_fullscreen)
+        header.addWidget(self.fullscreen_canvas_btn)
+        top_layout.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setFixedHeight(48)
+        strip = QWidget()
+        strip.setObjectName("toolStrip")
+        tools = QHBoxLayout(strip)
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setSpacing(5)
+
+        def add_tool_button(label, callback, tooltip=None):
+            button = styled_button(label)
+            if tooltip:
+                button.setToolTip(tooltip)
+            button.clicked.connect(callback)
+            tools.addWidget(button)
+            return button
+
+        for label, tool in [("Select", "select"), ("Text", "text"), ("Pencil", "pencil"),
+                            ("Highlight", "highlighter"), ("Eraser", "eraser"), ("Line", "line"),
+                            ("Arrow", "arrow"), ("Rectangle", "rect"), ("Rounded", "roundrect"),
+                            ("Ellipse", "ellipse")]:
+            add_tool_button(label, lambda checked=False, t=tool: self.toolbar_action(t))
+        tools.addWidget(self._top_separator())
+        add_tool_button("Insert files", self.choose_files)
+        add_tool_button("Export files", self.export_files)
+        add_tool_button("Offline link", self.add_link)
+        add_tool_button("Record audio", lambda: self.start_capture("audio"))
+        add_tool_button("Camera + mic", lambda: self.start_capture("camera"))
+        add_tool_button("Record screen", lambda: self.start_capture("screen"))
+        add_tool_button("Android USB", self.start_android_capture,
+                        "Record with a USB-debugging-enabled Android phone using ADB + scrcpy")
+        tools.addWidget(self._top_separator())
+        add_tool_button("Stroke", self.choose_stroke)
+        add_tool_button("Fill", self.choose_fill)
+        width_label = QLabel("Width")
+        width_label.setStyleSheet(f"color:{MUTED};padding-left:3px;")
+        tools.addWidget(width_label)
+        self.width_slider = QSlider(Qt.Orientation.Horizontal)
+        self.width_slider.setRange(1, 18)
+        self.width_slider.setValue(3)
+        self.width_slider.setFixedWidth(78)
+        self.width_slider.valueChanged.connect(lambda v: setattr(self.view, "stroke_width", v))
+        tools.addWidget(self.width_slider)
+        tools.addWidget(self._top_separator())
+        add_tool_button("Undo", self.undo, "Undo (Ctrl+Z)")
+        add_tool_button("Redo", self.redo, "Redo (Ctrl+Y)")
+        add_tool_button("Duplicate", self.duplicate_selected, "Duplicate (Ctrl+D)")
+        add_tool_button("Delete", self.delete_selected, "Delete selection")
+        add_tool_button("Front", lambda: self.order_selected(True), "Bring to front")
+        add_tool_button("Back", lambda: self.order_selected(False), "Send to back")
+        zoom_out = add_tool_button("−", lambda: self.zoom(1 / 1.15), "Zoom out")
+        zoom_in = add_tool_button("+", lambda: self.zoom(1.15), "Zoom in")
+        add_tool_button("100%", self.reset_zoom, "Reset zoom")
+        tools.addWidget(self._top_separator())
+        self.autosave_check = QCheckBox("Autosave")
         self.autosave_check.setChecked(self.autosave_enabled)
-        self.autosave_check.toggled.connect(self.toggle_autosave); side.addWidget(self.autosave_check)
-        change = styled_button("Change startup password"); change.clicked.connect(self.change_password); side.addWidget(change)
-        body.addWidget(sidebar)
+        self.autosave_check.toggled.connect(self.toggle_autosave)
+        tools.addWidget(self.autosave_check)
+        add_tool_button("Startup password", self.change_password)
+        strip.setMinimumWidth(strip.sizeHint().width())
+        scroll.setWidget(strip)
+        top_layout.addWidget(scroll)
+        layout.addWidget(top_panel)
+
         self.view.setMinimumSize(500, 400)
-        body.addWidget(self.view, 1)
-        layout.addLayout(body, 1)
+        layout.addWidget(self.view, 1)
         return root
+
+    def _top_separator(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setFrameShadow(QFrame.Shadow.Plain)
+        line.setStyleSheet("color:#303030;background:#303030;max-width:1px;")
+        line.setFixedWidth(1)
+        return line
+
+    def toggle_canvas_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_canvas_btn.setText("⛶ Canvas")
+        else:
+            self.showFullScreen()
+            self.fullscreen_canvas_btn.setText("⛶ Exit canvas")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_canvas_btn.setText("⛶ Canvas")
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def section_label(self, text):
         label = QLabel(text)
@@ -1648,6 +2320,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+Shift+Equal", lambda: self.zoom(1.15)),
             ("Ctrl+Minus", lambda: self.zoom(1/1.15)), ("Ctrl+0", self.reset_zoom),
             ("Escape", lambda: self.set_tool("select")), ("Ctrl+T", self.add_text),
+            ("F11", self.toggle_canvas_fullscreen),
         ]
         for seq, fn in shortcuts:
             a = QAction(self); a.setShortcut(QKeySequence(seq)); a.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
@@ -1660,6 +2333,8 @@ class MainWindow(QMainWindow):
         capture_menu = self.menuBar().addMenu("Capture")
         for label, mode in [("Record audio…", "audio"), ("Record camera + microphone…", "camera"), ("Record screen…", "screen")]:
             a = capture_menu.addAction(label); a.triggered.connect(lambda checked=False, m=mode: self.start_capture(m))
+        a = capture_menu.addAction("Record with Android USB camera…")
+        a.triggered.connect(self.start_android_capture)
         edit_menu = self.menuBar().addMenu("Edit")
         for label, fn in [("Undo", self.undo), ("Redo", self.redo), ("Select all", self.select_all),
                           ("Duplicate", self.duplicate_selected), ("Delete", self.delete_selected)]:
@@ -1672,13 +2347,15 @@ class MainWindow(QMainWindow):
     def apply_style(self):
         self.setStyleSheet(f"""
         QMainWindow,QWidget {{background:{BG};color:{TEXT};font-family:'Noto Sans','Segoe UI',sans-serif;font-size:12px;}}
-        QFrame#sidebar {{background:{PANEL};border:1px solid {BORDER};border-radius:16px;}}
+        QFrame#topPanel {{background:#050505;border:1px solid #222222;border-radius:10px;}}
+        QScrollArea {{background:#050505;border:0;}}
+        QWidget#toolStrip {{background:#050505;}}
         QMenuBar {{background:{BG};color:{TEXT};padding:4px;}}
-        QMenuBar::item:selected,QMenu::item:selected {{background:#203347;border-radius:5px;}}
+        QMenuBar::item:selected,QMenu::item:selected {{background:#303030;border-radius:5px;}}
         QMenu {{background:{PANEL};color:{TEXT};border:1px solid {BORDER};}}
         QStatusBar {{background:{PANEL};color:{MUTED};border:1px solid {BORDER};border-radius:8px;}}
         QCheckBox {{color:{MUTED};spacing:7px;}}
-        QSlider::groove:horizontal {{height:5px;background:#273349;border-radius:2px;}}
+        QSlider::groove:horizontal {{height:5px;background:#323232;border-radius:2px;}}
         QSlider::handle:horizontal {{background:{CYAN};width:14px;margin:-5px 0;border-radius:7px;}}
         """)
 
@@ -1772,6 +2449,33 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, APP_NAME, f"Could not initialize the recorder.\n\n{exc}")
 
+    def start_android_capture(self):
+        folder = self.temp_root / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        default_path = folder / "Android camera recording.mp4"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Choose Android recording filename", str(default_path),
+            "MP4 video (*.mp4)"
+        )
+        if not path:
+            return
+        target = Path(path)
+        if target.suffix.lower() != ".mp4":
+            target = target.with_suffix(".mp4")
+        if target.exists():
+            answer = QMessageBox.question(
+                self, APP_NAME, f"Replace {target.name}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            dialog = AndroidCameraCaptureDialog(target, self)
+            dialog.completed.connect(self._recording_completed)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not initialize Android camera recording.\\n\\n{exc}")
+
     def _recording_completed(self, path):
         try:
             file_path = Path(path)
@@ -1859,24 +2563,63 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(self, "Insert files", str(Path.home()), "All files (*)")
         if paths: self.import_files(paths, self.view.mapToScene(self.view.viewport().rect().topLeft() + __import__("PySide6.QtCore", fromlist=["QPoint"]).QPoint(40, 40)))
 
+    def _store_encrypted_attachment(self, plaintext_path: Path, vault_id: str | None = None) -> str:
+        """Persist an attachment as an authenticated encrypted blob in ./data/attachments."""
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.data_dir, 0o700)
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
+        vault_id = vault_id or (uuid.uuid4().hex + ".denc")
+        # Never allow manifest-controlled paths to escape the vault directory.
+        if Path(vault_id).name != vault_id or not vault_id.endswith(".denc"):
+            raise ValueError("Invalid encrypted attachment identifier.")
+        destination = self.vault_dir / vault_id
+        # Always refresh a requested ID: opening a different project may legitimately
+        # contain a same-named vault identifier whose payload must replace stale data.
+        staged = destination.with_name(destination.name + ".tmp-" + secrets.token_hex(4))
+        try:
+            stream_encrypt(plaintext_path, staged, self.storage_password)
+            os.chmod(staged, 0o600)
+            os.replace(staged, destination)
+            return vault_id
+        finally:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def import_files(self, paths, position):
+        """Copy attachments to session storage and persist encrypted blobs under ./data/."""
         x, y = position.x(), position.y()
+        session_storage = self.temp_root / "storage"
+        session_storage.mkdir(parents=True, exist_ok=True)
         for i, raw in enumerate(paths):
             src = Path(raw)
+            stored_path = None
             try:
-                if not src.is_file(): continue
+                if not src.is_file():
+                    continue
                 suffix = src.suffix.lower()
+                stored_path = session_storage / f"{uuid.uuid4().hex}_{src.name}"
+                with src.open("rb") as fin, stored_path.open("xb") as fout:
+                    shutil.copyfileobj(fin, fout, CHUNK)
+                    fout.flush()
+                    os.fsync(fout.fileno())
+                vault_id = self._store_encrypted_attachment(stored_path)
                 kind = "image" if suffix in (".png",".jpg",".jpeg",".gif",".bmp",".webp",".tif",".tiff") else (
                     "audio" if suffix in (".mp3",".wav",".flac",".ogg",".m4a",".aac") else (
                     "video" if suffix in (".mp4",".webm",".avi",".mkv",".mov",".m4v") else (
                     "pdf" if suffix == ".pdf" else "file")))
-                size = src.stat().st_size
+                size = stored_path.stat().st_size
                 details = f"{size:,} bytes · {suffix[1:].upper() if suffix else 'FILE'}"
                 item_data = {"x": x+i*28, "y": y+i*28,
-                             "path": str(src.resolve()), "name": src.name, "details": details,
+                             "path": str(stored_path.resolve()), "vault_id": vault_id,
+                             "name": Path(raw).name, "details": details,
                              "mime": suffix[1:].upper() if suffix else "File", "stroke": CYAN}
                 if kind == "image":
-                    reader = QImageReader(str(src))
+                    reader = QImageReader(str(stored_path))
                     reader.setAutoTransform(True)
                     image_size = reader.size()
                     if image_size.isValid() and image_size.width() > 0 and image_size.height() > 0:
@@ -1887,9 +2630,13 @@ class MainWindow(QMainWindow):
                         item_data["w"], item_data["h"] = 320, 220
                 else:
                     item_data["w"], item_data["h"] = 260, 140
-                item = CanvasItem(kind, item_data)
-                self.add_item(item)
-            except OSError as exc:
+                self.add_item(CanvasItem(kind, item_data))
+            except (OSError, ValueError) as exc:
+                if stored_path is not None:
+                    try:
+                        stored_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 QMessageBox.warning(self, APP_NAME, f"Could not insert {src.name}:\n{exc}")
         self.set_tool("select")
 
@@ -2116,7 +2863,7 @@ class MainWindow(QMainWindow):
         progress.setAutoReset(False)
         progress.setCancelButton(None)
         progress.setMinimumWidth(430)
-        progress.setStyleSheet(f"QProgressDialog{{background:{PANEL};color:{TEXT};border:1px solid {BORDER};border-radius:14px;padding:16px}} QLabel{{color:{TEXT};font-size:13px;padding:8px}} QProgressBar{{background:#080d18;border:1px solid {BORDER};border-radius:8px;height:16px;text-align:center;color:{TEXT}}} QProgressBar::chunk{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {CYAN},stop:1 {VIOLET});border-radius:7px}}")
+        progress.setStyleSheet(f"QProgressDialog{{background:{PANEL};color:{TEXT};border:1px solid {BORDER};border-radius:14px;padding:16px}} QLabel{{color:{TEXT};font-size:13px;padding:8px}} QProgressBar{{background:#0d0d0d;border:1px solid {BORDER};border-radius:8px;height:16px;text-align:center;color:{TEXT}}} QProgressBar::chunk{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {CYAN},stop:1 {VIOLET});border-radius:7px}}")
         progress.show()
         QApplication.processEvents()
         def update_progress(value, message):
@@ -2214,7 +2961,7 @@ class MainWindow(QMainWindow):
         progress.setStyleSheet(
             f"QProgressDialog{{background:{PANEL};color:{TEXT};border:1px solid {BORDER};"
             f"border-radius:14px;padding:16px}} QLabel{{color:{TEXT};font-size:13px;padding:8px}} "
-            f"QProgressBar{{background:#080d18;border:1px solid {BORDER};border-radius:8px;"
+            f"QProgressBar{{background:#0d0d0d;border:1px solid {BORDER};border-radius:8px;"
             f"height:16px;text-align:center;color:{TEXT}}} QProgressBar::chunk{{background:"
             f"qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {CYAN},stop:1 {VIOLET});border-radius:7px}}"
         )
@@ -2275,7 +3022,7 @@ class MainWindow(QMainWindow):
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False)
         progress.setCancelButton(None); progress.setMinimumWidth(430)
-        progress.setStyleSheet(f"QProgressDialog{{background:{PANEL};color:{TEXT};border:1px solid {BORDER};border-radius:14px;padding:16px}} QLabel{{color:{TEXT};font-size:13px;padding:8px}} QProgressBar{{background:#080d18;border:1px solid {BORDER};border-radius:8px;height:16px;text-align:center;color:{TEXT}}} QProgressBar::chunk{{background:{CYAN};border-radius:7px}}")
+        progress.setStyleSheet(f"QProgressDialog{{background:{PANEL};color:{TEXT};border:1px solid {BORDER};border-radius:14px;padding:16px}} QLabel{{color:{TEXT};font-size:13px;padding:8px}} QProgressBar{{background:#0d0d0d;border:1px solid {BORDER};border-radius:8px;height:16px;text-align:center;color:{TEXT}}} QProgressBar::chunk{{background:{CYAN};border-radius:7px}}")
         progress.show(); QApplication.processEvents()
         def report(value, message):
             progress.setValue(max(0, min(100, int(value))))
@@ -2319,6 +3066,11 @@ class MainWindow(QMainWindow):
                                 report(82 + int(restored_bytes * 12 / total_attachment_bytes), f"Restoring attachments… {restored_bytes // (1024 * 1024)} MB")
                     obj.pop("attachment", None)
                     obj["path"] = str(out)
+                    vault_id = obj.get("vault_id")
+                    try:
+                        obj["vault_id"] = self._store_encrypted_attachment(out, vault_id)
+                    except (OSError, ValueError) as vault_exc:
+                        raise OSError(f"Could not persist encrypted attachment {out.name}: {vault_exc}") from vault_exc
                     copied += 1
                 report(95, "Restoring canvas objects…")
                 # Only mutate the visible workspace after all archive data has been validated.
@@ -2366,9 +3118,56 @@ class MainWindow(QMainWindow):
         if not new.exec(): return
         if len(new.value()) < 8:
             QMessageBox.warning(self, APP_NAME, "Use at least 8 characters for a stronger password."); return
-        self.auth_data["auth"] = password_verifier(new.value())
-        save_auth(self.auth_data)
-        QMessageBox.information(self, APP_NAME, "Startup password changed. This does not change passwords on existing project files.")
+        old_password = d.value()
+        new_password = new.value()
+        encrypted_files = sorted(self.vault_dir.glob("*.denc")) if self.vault_dir.exists() else []
+        staged_files = []
+        try:
+            # Re-encrypt the vault before changing the login password. Decrypted staging
+            # files live only in the private session temp directory, never inside data/.
+            rekey_dir = self.temp_root / ("rekey-" + uuid.uuid4().hex)
+            rekey_dir.mkdir(parents=True, exist_ok=True)
+            for index, encrypted_path in enumerate(encrypted_files, start=1):
+                plain = rekey_dir / (uuid.uuid4().hex + ".plain")
+                staged = encrypted_path.with_name(encrypted_path.name + ".new-" + secrets.token_hex(4))
+                stream_decrypt(encrypted_path, plain, old_password)
+                try:
+                    stream_encrypt(plain, staged, new_password)
+                    os.chmod(staged, 0o600)
+                finally:
+                    plain.unlink(missing_ok=True)
+                staged_files.append((encrypted_path, staged))
+            # Commit only after every vault entry has been re-encrypted successfully.
+            backups = []
+            try:
+                for original, staged in staged_files:
+                    backup = original.with_name(original.name + ".old-" + secrets.token_hex(4))
+                    os.replace(original, backup)
+                    backups.append((original, backup))
+                    os.replace(staged, original)
+            except Exception:
+                for original, backup in reversed(backups):
+                    try:
+                        if backup.exists():
+                            original.unlink(missing_ok=True)
+                            os.replace(backup, original)
+                    except OSError:
+                        pass
+                raise
+            for _, backup in backups:
+                backup.unlink(missing_ok=True)
+            self.storage_password = new_password
+            self.auth_data["auth"] = password_verifier(new_password)
+            save_auth(self.auth_data)
+        except Exception as exc:
+            for _, staged in staged_files:
+                try:
+                    staged.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            QMessageBox.critical(self, APP_NAME, f"Password was not changed because the encrypted attachment vault could not be safely re-keyed.\n\n{exc}")
+            return
+        QMessageBox.information(self, APP_NAME, "Startup password changed. The encrypted attachment vault was re-encrypted with the new password; existing .dasweic project passwords are unchanged.")
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -2391,7 +3190,7 @@ class MainWindow(QMainWindow):
             event.ignore()
 
 
-def authenticate() -> dict | None:
+def authenticate() -> tuple[dict, str] | None:
     data = load_auth()
     # The initial password is set only on first run. Config stores a salted verifier, never plaintext.
     while True:
@@ -2399,7 +3198,7 @@ def authenticate() -> dict | None:
         if not dialog.exec():
             return None
         if verify_password(dialog.value(), data["auth"]):
-            return data
+            return data, dialog.value()
         QMessageBox.warning(None, APP_NAME, "Incorrect password. The workspace remains locked.")
 
 
@@ -2421,13 +3220,14 @@ def main():
     painter.end()
     splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
     splash.show(); app.processEvents()
-    auth = authenticate()
-    if auth is None:
+    authenticated = authenticate()
+    if authenticated is None:
         splash.close()
         return 0
+    auth, storage_password = authenticated
     splash.showMessage("Loading canvas tools and local settings…", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter, QColor(TEXT))
     app.processEvents()
-    window = MainWindow(auth)
+    window = MainWindow(auth, storage_password)
     window.show()
     splash.finish(window)
     return app.exec()

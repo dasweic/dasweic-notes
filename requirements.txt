@@ -1,7 +1,6 @@
-
-# Dasweic Notes dependencies
-PySide6>=6.7
+# Dasweic Notes — core desktop application dependencies
+PySide6>=6.7,<7
 cryptography>=42.0
-PyMuPDF>=1.24
 
-#   python -m pip install -r requirements.txt
+# PDF fallback renderer. QtPdf is used automatically when available.
+PyMuPDF>=1.24
